@@ -107,6 +107,10 @@ venv.bak/
 logs-*/
 *_output/
 debug/
+cpp/**/
+cpp/*.a
+cpp/*.txt
+cpp/*.wav
 
 # mac
 .DS_Store
