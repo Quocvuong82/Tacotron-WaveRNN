@@ -6,7 +6,6 @@ sys.path.append('..')
 import numpy as np
 import torch
 from wavernn.model import Model
-from wavernn.train import _bits, _pad
 
 
 def main():
@@ -23,7 +22,7 @@ def main():
     os.makedirs(inputs_dir, exist_ok=True)
 
     # Initialize Model
-    model = Model(rnn_dims=512, fc_dims=512, bits=_bits, pad=_pad,
+    model = Model(rnn_dims=256, fc_dims=256, bits=8, pad=2,
                   upsample_factors=(5, 5, 11), feat_dims=80,
                   compute_dims=128, res_out_dims=128, res_blocks=10)
 
@@ -42,7 +41,7 @@ def main():
                     f.write(f'static const double {name}[{param.shape[0]}] = ')
                     f.write('{')
                     for j, val in enumerate(param):
-                        f.write(str(round(val.item(), 6)))
+                        f.write("{:.6f}".format(val.item()))
                         if (j < len(param) - 1):
                             f.write(',')
                     f.write('};')
@@ -52,7 +51,7 @@ def main():
                     for j, row in enumerate(param):
                         f.write('{')
                         for k, val in enumerate(row):
-                            f.write(str(round(val.item(), 6)))
+                            f.write("{:.3f}".format(val.item()))
                             if (k < len(row) - 1):
                                 f.write(',')
                         f.write('}')
@@ -71,11 +70,11 @@ def main():
 
     # Save inputs
     print(f'Saving inputs into {inputs_dir}')
-    np.savetxt(os.path.join(inputs_dir, 'mels.txt'), mels, '%.6f')
-    np.savetxt(os.path.join(inputs_dir, 'aux_0.txt'), aux[0], '%.6f')
-    np.savetxt(os.path.join(inputs_dir, 'aux_1.txt'), aux[1], '%.6f')
-    np.savetxt(os.path.join(inputs_dir, 'aux_2.txt'), aux[2], '%.6f')
-    np.savetxt(os.path.join(inputs_dir, 'aux_3.txt'), aux[3], '%.6f')
+    np.savetxt(os.path.join(inputs_dir, 'mels.txt'), mels, '%.3f')
+    np.savetxt(os.path.join(inputs_dir, 'aux_0.txt'), aux[0], '%.3f')
+    np.savetxt(os.path.join(inputs_dir, 'aux_1.txt'), aux[1], '%.3f')
+    np.savetxt(os.path.join(inputs_dir, 'aux_2.txt'), aux[2], '%.3f')
+    np.savetxt(os.path.join(inputs_dir, 'aux_3.txt'), aux[3], '%.3f')
 
     print('Finish!!!')
 

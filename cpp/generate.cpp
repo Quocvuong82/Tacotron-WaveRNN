@@ -1,9 +1,7 @@
 #include <stdio.h>
 #include <chrono>
-#include <cmath>
 #include <iostream>
 #include <random>
-#include <string>
 #include <thread>
 
 #include "params/fc1_b.txt"
@@ -23,12 +21,11 @@
 #include "params/rnn2_wi.txt"
 #include "params/rnn2_wh.txt"
 
-#pragma warning(disable: 4996)
-
-#define SAMPLE_SIZE 83600
-#define HIDDEN_SIZE 512
+#define SAMPLE_SIZE 92675
+#define HIDDEN_SIZE 256
 #define MELS_DIM 80
 #define AUX_DIM 32
+#define DEBUG 1
 
 double mels[SAMPLE_SIZE][MELS_DIM];
 double aux_0[SAMPLE_SIZE][AUX_DIM];
@@ -37,6 +34,44 @@ double aux_2[SAMPLE_SIZE][AUX_DIM];
 double aux_3[SAMPLE_SIZE][AUX_DIM];
 
 using namespace std;
+
+template<class T, int n> class Array {
+private:
+    T array[n] = {};
+    T max = 0;
+    T min = 0;
+public:
+    void set(int i, T d) {
+        array[i] = d;
+        if (DEBUG) {
+            if (max < d) max = d;
+            if (min > d) min = d;
+        }
+    }
+
+    T get(int i) {
+        return array[i];
+    }
+
+    void print(char *s) {
+        printf("[%s] max:%.6f, min=%.6f\n", s, max, min);
+    }
+};
+
+Array<double, SAMPLE_SIZE> out;
+Array<double, 1 + MELS_DIM + AUX_DIM> I;
+Array<double, HIDDEN_SIZE + AUX_DIM> inp;
+Array<double, HIDDEN_SIZE> x;
+Array<double, HIDDEN_SIZE> p;
+Array<double, HIDDEN_SIZE> h1;
+Array<double, HIDDEN_SIZE> h2;
+Array<double, 1> sample;
+
+Array<double, HIDDEN_SIZE * 3> igates;
+Array<double, HIDDEN_SIZE * 3> hgates;
+Array<double, HIDDEN_SIZE> reset_gate;
+Array<double, HIDDEN_SIZE> input_gate;
+Array<double, HIDDEN_SIZE> new_gate;
 
 enum Layer {
     layer_I,
@@ -119,227 +154,207 @@ void loadfile() {
     t5.join();
 }
 
-template<class T> void savefile(T x[], int n) {
+void savefile() {
     FILE *fp;
     fp = fopen("output.txt", "w");
-    for (int i = 0; i < n; i++) {
-        fprintf(fp, "%.16f\n", x[i]);
+    for (int i = 0; i < SAMPLE_SIZE; i++) {
+        fprintf(fp, "%.16f\n", out.get(i));
     }
     fclose(fp);
 }
 
-template<class T> void debug(string tag, T x[], int n) {
-    T sum = 0;
-    T min = 0;
-    T max = 0;
-    for (int i = 0; i < n; i++) {
-        sum += x[i];
-        if (min > x[i]) {
-            min = x[i];
-        }
-        if (max < x[i]) {
-            max = x[i];
-        }
+template<class T> T exp_d(T x) {
+    x = 1. + x / 1024.;
+    for (int i = 0; i < 10; i++) {
+        x *= x;
     }
-
-    T avg = sum / n;
-
-    T var = 0;
-    for (int i = 0; i < n; i++) {
-        var += x[i] * x[i];
-    }
-    var = var / n - avg * avg;
-
-    printf("[%s] min:%lf, max:%lf, avg:%lf, var:%lf\n", tag.c_str(), min, max, avg, var);
+    return x;
 }
 
-template<class T> void relu(T x[], int n) {
-    T zero = 0;
+template<class T> void relu(T *x, int n) {
     for (int i = 0; i < n; i++) {
-        if (x[i] < 0) {
-            x[i] = zero;
+        if (x->get(i) < 0) {
+            x->set(i, 0.);
         }
     }
 }
 
-template<class T> void sigmoid(T x[], int n) {
-    for (int i = 0; i < n; i++) {
-        x[i] = 1.0 / (1.0 + exp(-x[i])); // TODO: exp tp pure c++
+template<class T> void sigmoid(T *x) {
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        x->set(i, 1. / (1. + exp_d(-x->get(i))));
     }
 }
 
-template<class T> void softmax(T x[], int n) {
-    T sum = 0;
-    for (int i = 0; i < n; i++) {
-        sum += exp(x[i]); // TODO: exp tp pure c++
+template<class T> void softmax(T *x) {
+    double tmp;
+    double sum = 0;
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        tmp = exp_d(x->get(i));
+        x->set(i, tmp);
+        sum += tmp;
     }
 
-    for (int i = 0; i < n; i++) {
-        x[i] = exp(x[i]) / sum;
-    }
-}
-
-template<class T> void tanh(T x[], int n) {
-    for (int i = 0; i < n; i++) {
-        x[i] = tanh(x[i]); // TODO: tanh to pure C++
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        x->set(i, x->get(i) / sum);
     }
 }
 
-template<class T> int choice(T x[], int n) {
+template<class T> void tanh(T *x) {
+    double plus;
+    double nega;
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        plus = exp_d(x->get(i));
+        nega = exp_d(-x->get(i));
+        x->set(i, (plus - nega) / (plus + nega)); // TODO: tanh to pure C++
+    }
+}
+
+template<class T> int choice(T *x) {
     random_device rnd;
     mt19937 mt(rnd());
     uniform_real_distribution<double> dist(0.0, 1.0);
     double threshold = dist(mt);
     int id = 0;
-    for (int i = 0; i < n; i++) {
-        if (threshold < x[i]) {
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        if (threshold < x->get(i)) {
             id = i;
             break;
         }
-        threshold -= x[i];
+        threshold -= x->get(i);
     }
     return id;
 }
 
-template<class T> void concat(T out[], T x[], int start, int end) {
+template<class T1, class T2> void concat(T1 *out, T2 *x, int start, int end) {
     for (int i = start; i < end; i++) {
-        out[i] = x[i - start];
+        out->set(i, x->get(i - start));
     }
 }
 
-template<class T> void add(T out[], T h[], int n) {
+template<class T1, class T2> void concat_2(T1 *out, T2 *x, int start, int end) {
+    for (int i = start; i < end; i++) {
+        out->set(i, x[i - start]);
+    }
+}
+
+template<class T> void add(T *out, T *h, int n) {
     for (int i = 0; i < n; i++) {
-        out[i] += h[i];
+        out->set(i, out->get(i) + h->get(i));
     }
 }
 
-template<class T> void linear(T out[], T x[], Layer layer) {
-    T sum;
+template<class T1, class T2> void linear(T1 *out, T2 *x, Layer layer) {
+    double sum;
     switch (layer) {
     case layer_I:
         for (int i = 0; i < HIDDEN_SIZE; i++) {
             sum = 0;
             for (int j = 0; j < 1 + MELS_DIM + AUX_DIM; j++) {
-                sum += x[j] * I_w[i][j];
+                sum += x->get(j) * I_w[i][j];
             }
-            out[i] = I_b[i] + sum;
+            out->set(i, I_b[i] + sum);
         }
         break;
     case layer_fc1:
         for (int i = 0; i < HIDDEN_SIZE; i++) {
             sum = 0;
             for (int j = 0; j < HIDDEN_SIZE + AUX_DIM; j++) {
-                sum += x[j] * fc1_w[i][j];
+                sum += x->get(j) * fc1_w[i][j];
             }
-            out[i] = fc1_b[i] + sum;
+            out->set(i, fc1_b[i] + sum);
         }
         break;
     case layer_fc2:
         for (int i = 0; i < HIDDEN_SIZE; i++) {
             sum = 0;
             for (int j = 0; j < HIDDEN_SIZE + AUX_DIM; j++) {
-                sum += x[j] * fc2_w[i][j];
+                sum += x->get(j) * fc2_w[i][j];
             }
-            out[i] = fc2_b[i] + sum;
+            out->set(i, fc2_b[i] + sum);
         }
         break;
     case layer_fc3:
         for (int i = 0; i < HIDDEN_SIZE; i++) {
             sum = 0;
             for (int j = 0; j < HIDDEN_SIZE; j++) {
-                sum += x[j] * fc3_w[i][j];
+                sum += x->get(j) * fc3_w[i][j];
             }
-            out[i] = fc3_b[i] + sum;
+            out->set(i, fc3_b[i] + sum);
         }
         break;
     case layer_rnn1_i:
         for (int i = 0; i < HIDDEN_SIZE * 3; i++) {
             sum = 0;
             for (int j = 0; j < HIDDEN_SIZE; j++) {
-                sum += x[j] * rnn1_wi[i][j];
+                sum += x->get(j) * rnn1_wi[i][j];
             }
-            out[i] = rnn1_bi[i] + sum;
+            out->set(i, rnn1_bi[i] + sum);
         }
         break;
     case layer_rnn1_h:
         for (int i = 0; i < HIDDEN_SIZE * 3; i++) {
             sum = 0;
             for (int j = 0; j < HIDDEN_SIZE; j++) {
-                sum += x[j] * rnn1_wh[i][j];
+                sum += x->get(j) * rnn1_wh[i][j];
             }
-            out[i] = rnn1_bh[i] + sum;
+            out->set(i, rnn1_bh[i] + sum);
         }
         break;
     case layer_rnn2_i:
         for (int i = 0; i < HIDDEN_SIZE * 3; i++) {
             sum = 0;
             for (int j = 0; j < HIDDEN_SIZE + AUX_DIM; j++) {
-                sum += x[j] * rnn2_wi[i][j];
+                sum += x->get(j) * rnn2_wi[i][j];
             }
-            out[i] = rnn2_bi[i] + sum;
+            out->set(i, rnn2_bi[i] + sum);
         }
         break;
     case layer_rnn2_h:
         for (int i = 0; i < HIDDEN_SIZE * 3; i++) {
             sum = 0;
             for (int j = 0; j < HIDDEN_SIZE; j++) {
-                sum += x[j] * rnn2_wh[i][j];
+                sum += x->get(j) * rnn2_wh[i][j];
             }
-            out[i] = rnn2_bh[i] + sum;
+            out->set(i, rnn2_bh[i] + sum);
         }
         break;
     }
 }
 
-template<class T> void gru(T x[], T h[], Layer layer) {
-    T igates[HIDDEN_SIZE * 3];
-    T hgates[HIDDEN_SIZE * 3];
-    T reset_gate[HIDDEN_SIZE];
-    T input_gate[HIDDEN_SIZE];
-    T new_gate[HIDDEN_SIZE];
-
+template<class T1, class T2> void gru(T1 *x, T2 *h, Layer layer) {
     // igates, hgates
     switch (layer) {
     case layer_rnn1:
-        linear(igates, x, layer_rnn1_i);
-        linear(hgates, h, layer_rnn1_h);
+        linear(&igates, x, layer_rnn1_i);
+        linear(&hgates, h, layer_rnn1_h);
         break;
     case layer_rnn2:
-        linear(igates, x, layer_rnn2_i);
-        linear(hgates, h, layer_rnn2_h);
+        linear(&igates, x, layer_rnn2_i);
+        linear(&hgates, h, layer_rnn2_h);
         break;
     }
 
     // reset_gate, input_gate
     for (int i = 0; i < HIDDEN_SIZE; i++) {
-        reset_gate[i] = igates[i] + hgates[i];
-        input_gate[i] = igates[HIDDEN_SIZE + i] + hgates[HIDDEN_SIZE + i];
+        reset_gate.set(i, igates.get(i) + hgates.get(i));
+        input_gate.set(i, igates.get(HIDDEN_SIZE + i) + hgates.get(HIDDEN_SIZE + i));
     }
-    sigmoid(reset_gate, HIDDEN_SIZE);
-    sigmoid(input_gate, HIDDEN_SIZE);
+    sigmoid(&reset_gate);
+    sigmoid(&input_gate);
 
     // new_gate
     for (int i = 0; i < HIDDEN_SIZE; i++) {
-        new_gate[i] = igates[HIDDEN_SIZE * 2 + i] + reset_gate[i] * hgates[HIDDEN_SIZE * 2 + i];
+        new_gate.set(i, igates.get(HIDDEN_SIZE * 2 + i) + (reset_gate.get(i) * hgates.get(HIDDEN_SIZE * 2 + i)));
     }
-    tanh(new_gate, HIDDEN_SIZE);
+    tanh(&new_gate);
 
     // h_next
     for (int i = 0; i < HIDDEN_SIZE; i++) {
-        h[i] = new_gate[i] + input_gate[i] * (h[i] - new_gate[i]);
+        h->set(i, new_gate.get(i) + (input_gate.get(i) * (h->get(i) - new_gate.get(i))));
     }
 }
 
 int main() {
-    double out[SAMPLE_SIZE];
-    double I[1 + MELS_DIM + AUX_DIM];
-    double inp[HIDDEN_SIZE + AUX_DIM];
-    double x[HIDDEN_SIZE];
-    double p[HIDDEN_SIZE];
-    double h1[HIDDEN_SIZE] = {};
-    double h2[HIDDEN_SIZE] = {};
-    double sample[1] = {};
-
     printf("***** Start WaveRNN inference *****\n");
 
     // load inputs
@@ -351,40 +366,40 @@ int main() {
     auto start = chrono::system_clock::now();
     for (int i = 0; i < SAMPLE_SIZE; i++) {
         // I
-        concat(I, sample, 0, 1);
-        concat(I, mels[i], 1, 1 + MELS_DIM);
-        concat(I, aux_0[i], 1 + MELS_DIM, 1 + MELS_DIM + AUX_DIM);
-        linear(x, I, layer_I);
+        concat(&I, &sample, 0, 1);
+        concat_2(&I, mels[i], 1, 1 + MELS_DIM);
+        concat_2(&I, aux_0[i], 1 + MELS_DIM, 1 + MELS_DIM + AUX_DIM);
+        linear(&x, &I, layer_I);
 
         // rnn1
-        gru(x, h1, layer_rnn1);
+        gru(&x, &h1, layer_rnn1);
 
         // rnn2
-        add(x, h1, HIDDEN_SIZE);
-        concat(inp, x, 0, HIDDEN_SIZE);
-        concat(inp, aux_1[i], HIDDEN_SIZE, HIDDEN_SIZE + AUX_DIM);
-        gru(inp, h2, layer_rnn2);
+        add(&x, &h1, HIDDEN_SIZE);
+        concat(&inp, &x, 0, HIDDEN_SIZE);
+        concat_2(&inp, aux_1[i], HIDDEN_SIZE, HIDDEN_SIZE + AUX_DIM);
+        gru(&inp, &h2, layer_rnn2);
 
         // fc1
-        add(x, h2, HIDDEN_SIZE);
-        concat(inp, x, 0, HIDDEN_SIZE);
-        concat(inp, aux_2[i], HIDDEN_SIZE, HIDDEN_SIZE + AUX_DIM);
-        linear(x, inp, layer_fc1);
-        relu(x, HIDDEN_SIZE);
+        add(&x, &h2, HIDDEN_SIZE);
+        concat(&inp, &x, 0, HIDDEN_SIZE);
+        concat_2(&inp, aux_2[i], HIDDEN_SIZE, HIDDEN_SIZE + AUX_DIM);
+        linear(&x, &inp, layer_fc1);
+        relu(&x, HIDDEN_SIZE);
 
         // fc2
-        concat(inp, x, 0, HIDDEN_SIZE);
-        concat(inp, aux_3[i], HIDDEN_SIZE, HIDDEN_SIZE + AUX_DIM);
-        linear(x, inp, layer_fc2);
-        relu(x, HIDDEN_SIZE);
+        concat(&inp, &x, 0, HIDDEN_SIZE);
+        concat_2(&inp, aux_3[i], HIDDEN_SIZE, HIDDEN_SIZE + AUX_DIM);
+        linear(&x, &inp, layer_fc2);
+        relu(&x, HIDDEN_SIZE);
 
         // fc3
-        linear(p, x, layer_fc3);
+        linear(&p, &x, layer_fc3);
 
         // categorize
-        softmax(p, HIDDEN_SIZE);
-        sample[0] = 2 * choice(p, HIDDEN_SIZE) / (HIDDEN_SIZE - 1.) - 1.;
-        out[i] = sample[0];
+        softmax(&p);
+        sample.set(0, 2 * choice(&p) / (HIDDEN_SIZE - 1.) - 1.);
+        out.set(i, sample.get(0));
 
         // show progress
         if (((i + 1) % (SAMPLE_SIZE / 10)) == 0) {
@@ -398,12 +413,27 @@ int main() {
         }
     }
 
+    // print debug
+    if (DEBUG) {
+        out.print("out");
+        I.print("I");
+        inp.print("inp");
+        x.print("x");
+        h1.print("h1");
+        h2.print("h2");
+        p.print("p");
+        igates.print("igates");
+        hgates.print("hgates");
+        reset_gate.print("reset_gate");
+        input_gate.print("input_gate");
+        new_gate.print("new_gate");
+    }
+
     // save outputs
     printf("Saving outputs to file...\n");
-    savefile(out, SAMPLE_SIZE);
+    savefile();
 
     printf("***** Finish WaveRNN inference *****\n");
-    system("pause");
 
     return 0;
 }
